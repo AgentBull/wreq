@@ -1,3 +1,5 @@
+//! Connection types and tunnel target overrides.
+
 mod timeout;
 mod tls_info;
 mod verbose;
@@ -12,6 +14,7 @@ use std::{
     fmt::{self, Debug, Formatter},
     io,
     io::IoSlice,
+    net::SocketAddr,
     pin::Pin,
     sync::{
         Arc,
@@ -38,14 +41,34 @@ use crate::{
     tls::{AlpnProtocol, TlsInfo},
 };
 
+/// Request extension that overrides the target address used for proxy tunnels
+/// (`CONNECT` authority and SOCKS target) while leaving the upstream request
+/// URI, `Host` or `:authority`, and TLS SNI and hostname verification unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TunnelTarget(pub SocketAddr);
+
+impl TunnelTarget {
+    /// Creates a new [`TunnelTarget`] for the given socket address.
+    #[inline]
+    pub const fn new(addr: SocketAddr) -> Self {
+        Self(addr)
+    }
+
+    /// Returns the underlying [`SocketAddr`].
+    #[inline]
+    pub const fn addr(self) -> SocketAddr {
+        self.0
+    }
+}
+
 /// HTTP connector with dynamic DNS resolver.
-pub type HttpConnector = http::HttpConnector<DynResolver, TcpConnector>;
+pub(crate) type HttpConnector = http::HttpConnector<DynResolver, TcpConnector>;
 
 /// Type-erased transport service retained after custom connector layers are composed.
-pub type BoxedTransportConnector = BoxCloneSyncService<Unnameable, Conn, BoxError>;
+pub(crate) type BoxedTransportConnector = BoxCloneSyncService<Unnameable, Conn, BoxError>;
 
 /// Type-erased layer applied while assembling a [`BoxedTransportConnector`].
-pub type BoxedConnectorLayer =
+pub(crate) type BoxedConnectorLayer =
     BoxCloneSyncServiceLayer<BoxedTransportConnector, Unnameable, Conn, BoxError>;
 
 /// A wrapper type for [`descriptor::ConnectionDescriptor`] used to erase its concrete type.

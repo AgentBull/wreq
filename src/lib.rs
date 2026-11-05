@@ -307,7 +307,6 @@ mod ext;
 #[macro_use]
 mod config;
 mod client;
-mod conn;
 mod error;
 mod group;
 mod into_uri;
@@ -318,6 +317,7 @@ mod util;
 
 #[cfg(feature = "cookies")]
 pub mod cookie;
+pub mod conn;
 pub mod dns;
 pub mod header;
 pub mod redirect;

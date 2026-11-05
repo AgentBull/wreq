@@ -1,5 +1,41 @@
 # wreq
 
+> **AgentBull Internal Patched Clone (`AgentBull/wreq`)**
+>
+> This repository is an internal patched clone of [`0x676e67/wreq`](https://github.com/0x676e67/wreq), maintained as a **single self-contained commit** on top of upstream `main`. It is referenced by `relay_native` in `AgentBull/saas` via Cargo's `[patch.crates-io]` with a pinned `rev`.
+>
+> ### Why We Maintain This Patch
+>
+> AgentBull Relay's outbound transport (`relay_native::transport`) has two requirements that upstream `wreq` does not support out of the box:
+>
+> 1. **Proxy Tunnel Target Pinning (`wreq::conn::TunnelTarget`) — SSRF & DNS Rebinding Defense**
+>    - **Problem**: Before opening an outbound connection, Relay resolves the upstream hostname locally and validates every resolved IP against private-network, loopback, link-local, and cloud-metadata blocklists. For direct connections, a custom DNS resolver pins the connection to those pre-validated IPs. However, when a request goes through an HTTP `CONNECT` or `SOCKS5` proxy, upstream `wreq` (`connect_via_proxy`) derives the tunnel target (`CONNECT host:port` authority or `SOCKS5` target address) directly from the request `Uri`, bypassing the custom DNS resolver. Rewriting the request `Uri` host to the validated IP is not an option because doing so corrupts the HTTP `Host` / `:authority` header, the TLS SNI server name, and X.509 certificate hostname verification.
+>    - **Patch (P1)**: Adds a per-request extension `wreq::conn::TunnelTarget` and threads it through `ConnectionDescriptor` into `connect_via_proxy` and `socks::connect`. When `TunnelTarget` is present on a request, the HTTP `CONNECT` authority and `SOCKS5` target use the pre-validated IP address while the request `Uri`, `Host` / `:authority`, TLS SNI, and certificate verification continue to use the original upstream hostname.
+>
+> 2. **Wire-Order HTTP/1.1 Header Emission (`wreq::header::OrderedHeaders`) — Client Impersonation Fidelity**
+>    - **Problem**: Official LLM CLI clients (such as Claude Code and Codex CLI) send headers in a specific order and casing. Standard `http::HeaderMap` lowercases all header names and does not guarantee iteration order across interleaved duplicate headers. Upstream `wreq` provides `OrigHeaderMap`, but `OrigHeaderMap` groups headers by lowercase name and retains only the first casing for duplicate header names, so interleaved duplicate headers (`X-Trace: 1`, `Accept: */*`, `x-trace: 2`) cannot be represented with their exact sequence and per-occurrence spelling.
+>    - **Patch (P2)**: Adds a per-request extension `wreq::header::OrderedHeaders` carrying `Vec<(Bytes, HeaderValue)>`. In `ConfigService`, when `OrigHeaderMap` is not set, a non-empty `OrderedHeaders` extension installs an internal `netty::ext::OnPreserveHeaderCallback` implementation that writes every listed header in exact wire order and original name bytes on HTTP/1.1, then drains any remaining unlisted entries (such as computed `Content-Length`) from `HeaderMap` without exposing internal `netty` callback traits in `wreq`'s public API.
+>
+> ### Patch Footprint & Upstream Sync Workflow
+>
+> All changes are kept in **one single commit** on top of upstream `main`, touching only 8 files:
+> - `src/lib.rs`
+> - `src/conn.rs`
+> - `src/conn/descriptor.rs`
+> - `src/conn/connector.rs`
+> - `src/conn/proxy/socks.rs`
+> - `src/client/layer/client.rs`
+> - `src/client/layer/config.rs`
+> - `src/header.rs`
+>
+> To sync with upstream `0x676e67/wreq`:
+> ```bash
+> git fetch upstream
+> git rebase --onto upstream/main HEAD^
+> git push --force-with-lease origin main
+> ```
+> After pushing, update the `wreq` `rev` (and matching `btls` / `http2` / `netty` `[patch.crates-io]` revs from `wreq/Cargo.toml`) in `AgentBull/saas` (`control_plane/native/relay_native/Cargo.toml`) so `Cargo.lock` and CI caches update atomically.
+
 [![CI](https://github.com/0x676e67/wreq/actions/workflows/ci.yml/badge.svg)](https://github.com/0x676e67/wreq/actions/workflows/ci.yml)
 [![Crates.io License](https://img.shields.io/crates/l/wreq)](https://github.com/0x676e67/wreq/blob/main/LICENSE)
 [![Crates.io MSRV](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fcrates.io%2Fapi%2Fv1%2Fcrates%2Fwreq%2Fversions%3Fsort%3Ddate%26per_page%3D1&query=%24.versions%5B0%5D.rust_version&suffix=.0&label=MSRV&color=blue&logo=rust)](https://crates.io/crates/wreq)

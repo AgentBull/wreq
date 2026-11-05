@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    net::SocketAddr,
     task::{Context, Poll},
 };
 
@@ -96,6 +97,7 @@ pub struct SocksConnector<C, R = GaiResolver> {
     auth: Option<(Bytes, Bytes)>,
     version: Version,
     dns_resolve: DnsResolve,
+    target_addr: Option<SocketAddr>,
 }
 
 impl<C, R> SocksConnector<C, R>
@@ -111,6 +113,7 @@ where
             version: Version::V5,
             dns_resolve: DnsResolve::Local,
             auth: None,
+            target_addr: None,
         }
     }
 
@@ -130,6 +133,12 @@ where
     #[inline]
     pub fn set_dns_mode(&mut self, dns_resolve: DnsResolve) {
         self.dns_resolve = dns_resolve;
+    }
+
+    /// Sets a pinned socket address to use as the SOCKS target instead of resolving `dst`.
+    #[inline]
+    pub fn set_target_addr(&mut self, target_addr: Option<SocketAddr>) {
+        self.target_addr = target_addr;
     }
 }
 
@@ -160,6 +169,7 @@ where
         let version = self.version;
         let dns_resolve = self.dns_resolve;
         let auth = self.auth.clone();
+        let pinned_target = self.target_addr;
         let mut resolver = self.resolver.clone();
 
         let fut = async move {
@@ -174,9 +184,11 @@ where
                 .map_err(Into::into)
                 .map_err(SocksError::ConnectFailed)?;
 
-            // Resolve the target address using the provided resolver.
-            let target_addr = match dns_resolve {
-                DnsResolve::Local => {
+            // Resolve the target address using the provided resolver, unless a
+            // pinned tunnel target address was supplied on the request.
+            let target_addr = match (pinned_target, dns_resolve) {
+                (Some(addr), _) => TargetAddr::Ip(addr),
+                (None, DnsResolve::Local) => {
                     let mut socket_addr = resolve(&mut resolver, Name::new(host.into()))
                         .await
                         .map(|mut s| s.next())
@@ -187,7 +199,7 @@ where
                     socket_addr.set_port(port);
                     TargetAddr::Ip(socket_addr)
                 }
-                DnsResolve::Remote => TargetAddr::Domain(Cow::Borrowed(host), port),
+                (None, DnsResolve::Remote) => TargetAddr::Domain(Cow::Borrowed(host), port),
             };
 
             match version {

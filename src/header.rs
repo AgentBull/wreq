@@ -4,6 +4,8 @@
 //! number of types used for interacting with `HeaderMap`. These types allow representing both
 //! HTTP/1 and HTTP/2 headers.
 
+use std::collections::BTreeMap;
+
 use bytes::Bytes;
 pub use http::header::*;
 use netty::ext::OnPreserveHeaderCallback;
@@ -187,6 +189,126 @@ impl IntoIterator for OrigHeaderMap {
 }
 
 impl_request_config_value!(OrigHeaderMap);
+
+/// Request extension that carries the header block in wire order.
+///
+/// A caller that must reproduce an exact HTTP/1.1 header block inserts this type into the
+/// request extensions. `wreq` writes each entry in the listed order with the listed name
+/// bytes, and then writes the `HeaderMap` entries that this list does not cover. The
+/// HTTP/2 encoder keeps its own order, so this type only changes the header set there.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OrderedHeaders {
+    entries: Vec<(Vec<u8>, HeaderValue)>,
+}
+
+impl OrderedHeaders {
+    /// Creates a new, empty [`OrderedHeaders`].
+    #[inline]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a new [`OrderedHeaders`] with the specified capacity.
+    #[inline]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Appends one header with the given name bytes and no deduplication.
+    ///
+    /// The name bytes are the wire spelling, so `X-Trace-Id` and `x-trace-id` stay two
+    /// separate entries with their own casing.
+    #[inline]
+    pub fn push(&mut self, name: &[u8], value: HeaderValue) {
+        self.entries.push((name.to_vec(), value));
+    }
+
+    /// Returns the number of listed headers.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns true if no header is listed.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Counts each listed header by name and value bytes.
+    ///
+    /// A header map entry that matches a listed entry is a duplicate of it, not an extra
+    /// header, so it must not be written twice.
+    fn listed_counts(&self) -> BTreeMap<(String, Vec<u8>), usize> {
+        let mut counts = BTreeMap::new();
+        for (name, value) in &self.entries {
+            if let Ok(name) = HeaderName::from_bytes(name) {
+                *counts
+                    .entry((name.as_str().to_string(), value.as_bytes().to_vec()))
+                    .or_insert(0) += 1;
+            }
+        }
+        counts
+    }
+}
+
+/// Writes every entry of `taken` that the listed counts do not cover.
+fn write_unlisted(
+    mut counts: BTreeMap<(String, Vec<u8>), usize>,
+    mut taken: HeaderMap,
+    mut visit: impl FnMut(&HeaderName, &HeaderValue),
+) {
+    let mut previous: Option<HeaderName> = None;
+    for (name, value) in taken.drain() {
+        if let Some(name) = name {
+            previous = Some(name);
+        }
+        let Some(name) = previous.as_ref() else {
+            continue;
+        };
+        let key = (name.as_str().to_string(), value.as_bytes().to_vec());
+        match counts.get_mut(&key) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => visit(name, &value),
+        }
+    }
+}
+
+impl OnPreserveHeaderCallback for OrderedHeaders {
+    fn call(&self, headers: &mut HeaderMap) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let counts = self.listed_counts();
+        let taken = std::mem::take(headers);
+        let mut rebuilt = HeaderMap::with_capacity(taken.len() + self.entries.len());
+        for (raw_name, value) in &self.entries {
+            if let Ok(name) = HeaderName::from_bytes(raw_name) {
+                rebuilt.append(name, value.clone());
+            }
+        }
+        write_unlisted(counts, taken, |name, value| {
+            rebuilt.append(name.clone(), value.clone());
+        });
+        *headers = rebuilt;
+    }
+
+    fn call_visit(
+        &self,
+        headers: &mut HeaderMap,
+        dst: &mut dyn FnMut(&dyn AsRef<[u8]>, &HeaderValue),
+    ) {
+        for (raw_name, value) in &self.entries {
+            dst(raw_name, value);
+        }
+        let counts = self.listed_counts();
+        write_unlisted(counts, std::mem::take(headers), |name, value| {
+            dst(name, value);
+        });
+    }
+}
 
 /// An HTTP header name with both normalized and original casing.
 ///

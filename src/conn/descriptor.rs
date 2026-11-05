@@ -10,7 +10,12 @@ use std::{
 use http::{Uri, Version};
 use lru::DefaultHasher;
 
-use crate::{conn::net::SocketBindOptions, group::Group, proxy::Matcher, tls::TlsOptions};
+use crate::{
+    conn::{TunnelTarget, net::SocketBindOptions},
+    group::Group,
+    proxy::Matcher,
+    tls::TlsOptions,
+};
 
 /// A key that uniquely identifies a group of interchangeable connections for pooling.
 ///
@@ -32,6 +37,7 @@ pub(crate) struct ConnectionDescriptor {
     proxy: Option<Matcher>,
     tls_options: Option<TlsOptions>,
     socket_bind: Option<SocketBindOptions>,
+    tunnel_target: Option<TunnelTarget>,
     connection_id: ConnectionId,
 }
 
@@ -80,6 +86,7 @@ impl ConnectionDescriptor {
         version: Option<Version>,
         tls_options: Option<TlsOptions>,
         socket_bind: Option<SocketBindOptions>,
+        tunnel_target: Option<TunnelTarget>,
     ) -> ConnectionDescriptor {
         let connection_id = {
             group
@@ -96,8 +103,15 @@ impl ConnectionDescriptor {
             version,
             tls_options,
             socket_bind,
+            tunnel_target,
             connection_id,
         }
+    }
+
+    /// Return the pinned tunnel target for proxy connections, if any.
+    #[inline]
+    pub(crate) fn tunnel_target(&self) -> Option<TunnelTarget> {
+        self.tunnel_target
     }
 
     /// Returns a [`ConnectionId`] group ID for this descriptor.
