@@ -1,5 +1,19 @@
 # wreq
 
+## AgentBull fork
+
+AgentBull Relay uses this fork of [`0x676e67/wreq`](https://github.com/0x676e67/wreq) as the HTTP client for Relay Native. The fork keeps the Relay changes in one commit on top of upstream `main`.
+
+- **Pinned proxy targets.** The `wreq::conn::TunnelTarget` request extension lets HTTP CONNECT and SOCKS5 use the IP address that Relay has already validated. The request keeps the origin authority for HTTP routing, TLS SNI, and certificate verification.
+- **Ordered HTTP/1.1 headers.** The `wreq::header::OrderedHeaders` request extension preserves the order and casing of each header occurrence, including repeated names interleaved with other headers. The client appends remaining headers from its header map.
+- **Custom proxy tunnels.** `wreq::Proxy::tunnel` accepts an async dialer that returns a byte stream. The dialer receives the origin URI and any request-level `TunnelTarget`. The dialer handles proxy negotiation and authentication. wreq sends origin-form requests and performs destination TLS over the returned stream when required. Use separate connection pool groups for requests whose tunnels must stay isolated.
+
+### Sync with upstream
+
+Fetch both remotes. Rebase the Relay patch onto upstream `main` and run the proxy, TLS, and WebSocket regression tests. Before rewriting the fork's `main`, keep a remote tag for each older commit that a supported SaaS lockfile still references. Push the rebased commit with `--force-with-lease` against the fork head recorded at fetch time.
+
+Relay Native declares the fork in `control_plane/native/relay_native/Cargo.toml` in the SaaS repository. With a `branch = "main"` dependency, update the locked commit using `cargo update -p wreq --precise <new-sha>` in that crate. Match any changed `btls`, `http2`, and `netty` revisions to this fork's manifest. Verify the resulting `Cargo.lock` with `cargo fetch --locked` from a fresh Git dependency cache.
+
 [![CI](https://github.com/0x676e67/wreq/actions/workflows/ci.yml/badge.svg)](https://github.com/0x676e67/wreq/actions/workflows/ci.yml)
 [![Crates.io License](https://img.shields.io/crates/l/wreq)](https://github.com/0x676e67/wreq/blob/main/LICENSE)
 [![Crates.io MSRV](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fcrates.io%2Fapi%2Fv1%2Fcrates%2Fwreq%2Fversions%3Fsort%3Ddate%26per_page%3D1&query=%24.versions%5B0%5D.rust_version&suffix=.0&label=MSRV&color=blue&logo=rust)](https://crates.io/crates/wreq)

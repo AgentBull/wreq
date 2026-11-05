@@ -103,3 +103,62 @@ async fn verify_host_overrides_uri_host() {
     assert!(get("192.0.2.1").await.unwrap().status().is_success());
     assert!(get("other.test").await.is_err());
 }
+
+#[tokio::test]
+async fn custom_tunnel_verifies_origin_with_a_pinned_target() {
+    use wreq::{Proxy, conn::TunnelTarget, tls::TlsInfo};
+
+    let (cert, key) = self_signed();
+    let target = TunnelTarget::new(serve(&cert, &key).await);
+    let store = CertStore::builder()
+        .add_der_cert(&cert.to_der().unwrap())
+        .build()
+        .unwrap();
+    let client = Client::builder()
+        .no_proxy()
+        .tls_cert_store(store)
+        .tls_info(true)
+        .proxy(Proxy::tunnel(move |uri, pin| async move {
+            assert_eq!(uri.host(), Some("wreq.test"));
+            assert_eq!(pin, Some(target));
+            Ok(tokio::net::TcpStream::connect(pin.unwrap().addr()).await?)
+        }))
+        .build()
+        .unwrap();
+
+    let mut request = client.get("https://wreq.test/").build().unwrap();
+    request.extensions_mut().insert(target);
+    let response = client.execute(request).await.unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(
+        response
+            .extensions()
+            .get::<TlsInfo>()
+            .unwrap()
+            .peer_certificate(),
+        Some(cert.to_der().unwrap().as_slice())
+    );
+}
+
+#[tokio::test]
+async fn http_over_https_proxy() {
+    let (cert, key) = self_signed();
+    let addr = serve(&cert, &key).await;
+    let store = CertStore::builder()
+        .add_der_cert(&cert.to_der().unwrap())
+        .build()
+        .unwrap();
+
+    let response = Client::builder()
+        .resolve("wreq.test", addr)
+        .tls_cert_store(store)
+        .proxy(wreq::Proxy::all(format!("https://wreq.test:{}", addr.port())).unwrap())
+        .build()
+        .unwrap()
+        .get("http://origin.invalid/path")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+}

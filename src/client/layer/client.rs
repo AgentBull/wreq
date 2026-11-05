@@ -43,7 +43,7 @@ use crate::{
     client::layer::config::RequestOptions,
     config::RequestConfig,
     conn::{
-        Connected, Connection,
+        Connected, Connection, TunnelTarget,
         descriptor::{ConnectionDescriptor, ConnectionId},
         proxy,
     },
@@ -201,6 +201,7 @@ where
                 http2_options,
                 socket_bind_options,
             } = RequestConfig::<RequestOptions>::remove(req.extensions_mut()).unwrap_or_default();
+            let tunnel_target = req.extensions_mut().remove::<TunnelTarget>();
 
             #[cfg(not(feature = "http2"))]
             if version == Some(Version::HTTP_2) {
@@ -220,7 +221,15 @@ where
                 builders = Some(own);
             }
 
-            ConnectionDescriptor::new(uri, group, proxy, version, tls_options, socket_bind_options)
+            ConnectionDescriptor::new(
+                uri,
+                group,
+                proxy,
+                version,
+                tls_options,
+                socket_bind_options,
+                tunnel_target,
+            )
         };
 
         let this = self.inner.clone();

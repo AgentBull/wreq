@@ -15,8 +15,8 @@ use tower::{
 #[cfg(unix)]
 use super::net::UnixConnector;
 use super::{
-    AsyncConnWithInfo, BoxedConnectorLayer, BoxedTransportConnector, Conn, Connection,
-    HttpConnector, TlsConn, TlsInfoFactory, Unnameable,
+    AsyncConnWithInfo, BoxedConnectorLayer, BoxedTransportConnector, Conn, Connected, Connection,
+    HttpConnector, TlsConn, TlsInfoFactory, TunnelTarget, Unnameable,
     descriptor::ConnectionDescriptor,
     http::HttpConnect,
     net::TcpConnector,
@@ -28,7 +28,7 @@ use crate::{
     dns::DynResolver,
     error::{ProxyConnect, map_timeout_to_connector_error},
     ext::UriExt,
-    proxy::{Intercepted, Matcher as ProxyMatcher, matcher::Intercept},
+    proxy::{BoxedTunnel, Intercepted, Matcher as ProxyMatcher, matcher::Intercept},
     rt::Timer,
     tls::{
         TlsOptions,
@@ -37,6 +37,14 @@ use crate::{
         },
     },
 };
+
+impl Connection for BoxedTunnel {
+    fn connected(&self) -> Connected {
+        Connected::new()
+    }
+}
+
+impl TlsInfoFactory for BoxedTunnel {}
 
 /// Client-wide connection settings retained by each transport connector.
 ///
@@ -342,8 +350,20 @@ impl TransportConnector {
         proxy: Intercepted,
     ) -> Result<Conn, BoxError> {
         let uri = descriptor.uri().clone();
+        let tunnel_target = descriptor.tunnel_target();
 
         match proxy {
+            Intercepted::Tunnel(dialer) => {
+                let mut connector = self.build_https_connector(uri.is_https(), &descriptor)?;
+                let conn = dialer
+                    .dial(uri, tunnel_target)
+                    .await
+                    .map_err(ProxyConnect)?;
+                let io = connector
+                    .call(EstablishedConn::new(conn, descriptor))
+                    .await?;
+                self.tunnel_conn_from_stream(io)
+            }
             Intercepted::Proxy(proxy) => {
                 let is_https = uri.is_https();
                 let proxy_uri = proxy.uri().clone();
@@ -372,6 +392,7 @@ impl TransportConnector {
                             socks.set_auth(proxy.raw_auth());
                             socks.set_version(version);
                             socks.set_dns_mode(dns_resolve);
+                            socks.set_target_addr(tunnel_target.map(TunnelTarget::addr));
                             socks.call(uri).await?
                         };
 
@@ -415,8 +436,10 @@ impl TransportConnector {
                             tunnel = tunnel.with_headers(headers.clone());
                         }
 
+                        let tunnel_uri = tunnel_target_uri(&uri, tunnel_target)?;
+
                         // Connect to the proxy and establish the tunnel.
-                        tunnel.call(uri).await?
+                        tunnel.call(tunnel_uri).await?
                     };
 
                     // Wrap the established tunneled stream with TLS.
@@ -462,7 +485,8 @@ impl TransportConnector {
                         let mut tunnel =
                             proxy::tunnel::TunnelConnector::new(proxy_uri, connector.clone());
 
-                        tunnel.call(uri).await?
+                        let tunnel_uri = tunnel_target_uri(&uri, tunnel_target)?;
+                        tunnel.call(tunnel_uri).await?
                     };
 
                     // Wrap the established tunneled stream with TLS.
@@ -518,4 +542,16 @@ impl Service<ConnectionDescriptor> for TransportConnector {
     fn call(&mut self, descriptor: ConnectionDescriptor) -> Self::Future {
         Box::pin(self.clone().connect_auto(descriptor))
     }
+}
+
+fn tunnel_target_uri(
+    uri: &http::Uri,
+    tunnel_target: Option<TunnelTarget>,
+) -> Result<http::Uri, BoxError> {
+    let Some(target) = tunnel_target else {
+        return Ok(uri.clone());
+    };
+    let mut parts = uri.clone().into_parts();
+    parts.authority = Some(http::uri::Authority::try_from(target.addr().to_string())?);
+    Ok(http::Uri::from_parts(parts)?)
 }
