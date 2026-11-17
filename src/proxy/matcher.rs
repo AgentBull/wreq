@@ -26,7 +26,7 @@ use ipnet::IpNet;
 use percent_encoding::percent_decode_str;
 
 use self::builder::IntoValue;
-use super::{Extra, Intercepted};
+use super::{Extra, Intercepted, TunnelDialer};
 use crate::ext::UriExt;
 
 /// A proxy matcher, usually built from environment variables.
@@ -35,6 +35,7 @@ pub struct Matcher {
     http: Option<Intercept>,
     https: Option<Intercept>,
     no: NoProxy,
+    tunnel: Option<TunnelDialer>,
     #[cfg(unix)]
     unix: Option<Arc<Path>>,
 }
@@ -113,6 +114,17 @@ impl Matcher {
         Builder::default()
     }
 
+    pub(super) fn tunnel(dialer: TunnelDialer, no_proxy: &str) -> Self {
+        Self {
+            http: None,
+            https: None,
+            no: NoProxy::from_string(no_proxy),
+            tunnel: Some(dialer),
+            #[cfg(unix)]
+            unix: None,
+        }
+    }
+
     /// Check if the destination should be intercepted by a proxy.
     ///
     /// If the proxy rules match the destination, a new `Uri` will be returned
@@ -127,6 +139,11 @@ impl Matcher {
         // TODO(perf): don't need to check `no` if below doesn't match...
         if self.no.contains(dst.host()?) {
             return None;
+        }
+        if let Some(dialer) = &self.tunnel
+            && (dst.is_http() || dst.is_https())
+        {
+            return Some(Intercepted::Tunnel(dialer.clone()));
         }
         if dst.is_http() {
             return self.http.clone().map(Intercepted::Proxy);
@@ -273,6 +290,7 @@ impl Builder {
                 http: None,
                 https: None,
                 no: NoProxy::empty(),
+                tunnel: None,
                 #[cfg(unix)]
                 unix: None,
             };
@@ -298,6 +316,7 @@ impl Builder {
             http: http.or_else(|| all.clone()),
             https: https.or(all),
             no: NoProxy::from_string(&self.no),
+            tunnel: None,
             #[cfg(unix)]
             unix: self.unix,
         }
@@ -651,6 +670,7 @@ mod tests {
     fn intercept(p: &Matcher, u: &str) -> Intercept {
         match p.intercept(&u.parse().unwrap()).unwrap() {
             Intercepted::Proxy(intercept) => intercept,
+            Intercepted::Tunnel(_) => unreachable!("expected a URI proxy"),
             #[cfg(unix)]
             Intercepted::Unix(path) => {
                 unreachable!("should not intercept unix socket: {path:?}")

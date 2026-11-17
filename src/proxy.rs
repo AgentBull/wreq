@@ -7,13 +7,22 @@ mod win;
 
 pub(crate) mod matcher;
 
-use std::hash::{Hash, Hasher};
 #[cfg(unix)]
-use std::{path::Path, sync::Arc};
+use std::path::Path;
+use std::{
+    fmt,
+    future::Future,
+    hash::{Hash, Hasher},
+    pin::Pin,
+    sync::Arc,
+};
 
+use futures_util::future::BoxFuture;
 use http::{HeaderMap, Uri, header::HeaderValue};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tower::BoxError;
 
-use crate::{IntoUri, ext::UriExt};
+use crate::{IntoUri, conn::TunnelTarget, ext::UriExt};
 
 // # Internals
 //
@@ -77,6 +86,7 @@ pub struct NoProxy {
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) enum Intercepted {
     Proxy(matcher::Intercept),
+    Tunnel(TunnelDialer),
     #[cfg(unix)]
     Unix(Arc<Path>),
 }
@@ -91,8 +101,56 @@ enum ProxyScheme {
     All(Uri),
     Http(Uri),
     Https(Uri),
+    Tunnel(TunnelDialer),
     #[cfg(unix)]
     Unix(Arc<Path>),
+}
+
+pub(crate) trait TunnelStream: AsyncRead + AsyncWrite + Send + Sync {}
+impl<T: AsyncRead + AsyncWrite + Send + Sync> TunnelStream for T {}
+
+impl fmt::Debug for dyn TunnelStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("TunnelStream")
+    }
+}
+
+pub(crate) type BoxedTunnel = Pin<Box<dyn TunnelStream>>;
+type Dial = dyn Fn(Uri, Option<TunnelTarget>) -> BoxFuture<'static, Result<BoxedTunnel, BoxError>>
+    + Send
+    + Sync;
+
+#[derive(Clone)]
+pub(crate) struct TunnelDialer(Arc<Dial>);
+
+impl TunnelDialer {
+    pub(crate) async fn dial(
+        &self,
+        uri: Uri,
+        target: Option<TunnelTarget>,
+    ) -> Result<BoxedTunnel, BoxError> {
+        (self.0)(uri, target).await
+    }
+}
+
+impl fmt::Debug for TunnelDialer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("TunnelDialer")
+    }
+}
+
+impl PartialEq for TunnelDialer {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for TunnelDialer {}
+
+impl Hash for TunnelDialer {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.0).cast::<()>().hash(state);
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -191,6 +249,31 @@ impl Proxy {
         }
     }
 
+    /// Dial a byte-stream tunnel for HTTP and HTTPS destinations.
+    ///
+    /// The dialer receives the destination origin URI and any request-level [`TunnelTarget`].
+    /// When present, use the override as the tunnel destination. The client retains the
+    /// URI for HTTP authority and performs any destination TLS handshake over the stream.
+    /// Handle proxy authentication and protocol negotiation inside the dialer.
+    /// The dialer runs when a new connection is needed. Use a distinct [`Group`](crate::Group)
+    /// for requests whose tunnel targets or dialer state must not share pooled connections.
+    pub fn tunnel<F, Fut, IO>(dial: F) -> Proxy
+    where
+        F: Fn(Uri, Option<TunnelTarget>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<IO, BoxError>> + Send + 'static,
+        IO: AsyncRead + AsyncWrite + Send + Sync + 'static,
+    {
+        Self::new(ProxyScheme::Tunnel(TunnelDialer(Arc::new(
+            move |uri, target| {
+                let future = dial(uri, target);
+                Box::pin(async move {
+                    let stream: BoxedTunnel = Box::pin(future.await?);
+                    Ok(stream)
+                })
+            },
+        ))))
+    }
+
     /// Set the `Proxy-Authorization` header using Basic auth.
     ///
     /// # Example
@@ -212,6 +295,7 @@ impl Proxy {
                 uri.set_userinfo(username, Some(password));
                 self.extra.auth = Some(header);
             }
+            ProxyScheme::Tunnel(_) => {}
             #[cfg(unix)]
             ProxyScheme::Unix(_) => {
                 // For Unix sockets, we don't set the auth header.
@@ -261,6 +345,7 @@ impl Proxy {
             ProxyScheme::All(_) | ProxyScheme::Http(_) | ProxyScheme::Https(_) => {
                 self.extra.misc = Some(headers);
             }
+            ProxyScheme::Tunnel(_) => {}
             #[cfg(unix)]
             ProxyScheme::Unix(_) => {
                 // For Unix sockets, we don't set custom headers.
@@ -311,6 +396,7 @@ impl Proxy {
                 .https(uri.to_string())
                 .no(no_proxy)
                 .build(extra),
+            ProxyScheme::Tunnel(dialer) => matcher::Matcher::tunnel(dialer, no_proxy),
             #[cfg(unix)]
             ProxyScheme::Unix(unix) => matcher::Matcher::builder()
                 .unix(unix)
@@ -411,7 +497,6 @@ mod tests {
     fn intercept(p: &Matcher, s: &Uri) -> matcher::Intercept {
         match p.intercept(s).unwrap() {
             Intercepted::Proxy(proxy) => proxy,
-            #[cfg(unix)]
             _ => {
                 unreachable!("intercepted_port should only be called with a Proxy matcher")
             }
@@ -421,7 +506,6 @@ mod tests {
     fn intercepted_uri(p: &Matcher, s: &str) -> Uri {
         match p.intercept(&s.parse().unwrap()).unwrap() {
             Intercepted::Proxy(proxy) => proxy.uri().clone(),
-            #[cfg(unix)]
             _ => {
                 unreachable!("intercepted_uri should only be called with a Proxy matcher")
             }
