@@ -15,7 +15,7 @@ use tower::{
 #[cfg(unix)]
 use super::net::UnixConnector;
 use super::{
-    AsyncConnWithInfo, BoxedConnectorLayer, BoxedTransportConnector, Conn, Connection,
+    AsyncConnWithInfo, BoxedConnectorLayer, BoxedTransportConnector, Conn, Connected, Connection,
     HttpConnector, TlsConn, TlsInfoFactory, TunnelTarget, Unnameable,
     descriptor::ConnectionDescriptor,
     http::HttpConnect,
@@ -28,7 +28,7 @@ use crate::{
     dns::DynResolver,
     error::{ProxyConnect, map_timeout_to_connector_error},
     ext::UriExt,
-    proxy::{Intercepted, Matcher as ProxyMatcher, matcher::Intercept},
+    proxy::{BoxedTunnel, Intercepted, Matcher as ProxyMatcher, matcher::Intercept},
     rt::Timer,
     tls::{
         TlsOptions,
@@ -37,6 +37,14 @@ use crate::{
         },
     },
 };
+
+impl Connection for BoxedTunnel {
+    fn connected(&self) -> Connected {
+        Connected::new()
+    }
+}
+
+impl TlsInfoFactory for BoxedTunnel {}
 
 /// Client-wide connection settings retained by each transport connector.
 ///
@@ -345,6 +353,17 @@ impl TransportConnector {
         let tunnel_target = descriptor.tunnel_target();
 
         match proxy {
+            Intercepted::Tunnel(dialer) => {
+                let mut connector = self.build_https_connector(uri.is_https(), &descriptor)?;
+                let conn = dialer
+                    .dial(uri, tunnel_target)
+                    .await
+                    .map_err(ProxyConnect)?;
+                let io = connector
+                    .call(EstablishedConn::new(conn, descriptor))
+                    .await?;
+                self.tunnel_conn_from_stream(io)
+            }
             Intercepted::Proxy(proxy) => {
                 let is_https = uri.is_https();
                 let proxy_uri = proxy.uri().clone();

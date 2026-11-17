@@ -404,35 +404,132 @@ async fn tunnel_includes_user_agent() {
 #[tokio::test]
 async fn proxy_tunnel_connect_error() {
     let client = Client::builder()
-        .tls_cert_verification(false)
+        .resolve_to_addrs("proxy.invalid", [])
+        .resolve_to_addrs("origin.invalid", [])
         .no_proxy()
         .build()
         .unwrap();
 
-    let invalid_proxies = vec![
-        "http://invalid.proxy:8080",
-        "https://invalid.proxy:8080",
-        "socks4://invalid.proxy:8080",
-        "socks4a://invalid.proxy:8080",
-        "socks5://invalid.proxy:8080",
-        "socks5h://invalid.proxy:8080",
-    ];
-
-    let target_urls = ["https://example.com", "http://example.com"];
-
-    for proxy in invalid_proxies {
-        for url in target_urls {
+    for scheme in ["http", "https", "socks4", "socks4a", "socks5", "socks5h"] {
+        let proxy = wreq::Proxy::all(format!("{scheme}://proxy.invalid:8080")).unwrap();
+        for url in ["https://origin.invalid/", "http://origin.invalid/"] {
             let err = client
                 .get(url)
-                .proxy(wreq::Proxy::all(proxy).unwrap())
+                .proxy(proxy.clone())
                 .send()
                 .await
                 .unwrap_err();
 
             assert!(
                 err.is_proxy_connect(),
-                "proxy connect error expected, got: {err:?}"
+                "{scheme} proxy connect error for {url} expected, got: {err:?}"
             );
         }
     }
+}
+
+#[tokio::test]
+async fn custom_tunnel_uses_origin_form() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let proxy = wreq::Proxy::tunnel(|uri, target| async move {
+        assert_eq!(uri.host(), Some("origin.invalid"));
+        assert!(target.is_none());
+
+        let (stream, mut peer) = tokio::io::duplex(1024);
+        tokio::spawn(async move {
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(peer.read_u8().await.unwrap());
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.starts_with("GET /path HTTP/1.1\r\n"));
+            assert!(request.contains("\r\nhost: origin.invalid\r\n"));
+            peer.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+        Ok(stream)
+    });
+
+    let response = Client::builder()
+        .no_proxy()
+        .proxy(proxy)
+        .connector_layer(tower::layer::util::Identity::new())
+        .build()
+        .unwrap()
+        .get("http://origin.invalid/path")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.text().await.unwrap(), "ok");
+}
+
+#[tokio::test]
+async fn custom_tunnel_dial_error_is_a_proxy_error() {
+    let client = Client::builder().no_proxy().build().unwrap();
+    let proxy = wreq::Proxy::tunnel(|_, _| async {
+        Err::<tokio::io::DuplexStream, _>(std::io::Error::other("dial failed").into())
+    });
+
+    let err = client
+        .get("https://origin.invalid/")
+        .proxy(proxy)
+        .send()
+        .await
+        .unwrap_err();
+    assert!(err.is_proxy_connect());
+}
+
+#[cfg(feature = "socks")]
+#[tokio::test]
+async fn socks5_tunnel_uses_origin_form() {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy = wreq::Proxy::all(format!("socks5h://{}", listener.local_addr().unwrap())).unwrap();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut greeting = [0; 3];
+        stream.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(greeting, [5, 1, 0]);
+        stream.write_all(&[5, 0]).await.unwrap();
+
+        let host = b"origin.invalid";
+        let mut request = vec![0; 5 + host.len() + 2];
+        stream.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request[..5], &[5, 1, 0, 3, host.len() as u8]);
+        assert_eq!(&request[5..5 + host.len()], host);
+        assert_eq!(&request[5 + host.len()..], &80u16.to_be_bytes());
+        stream
+            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 80])
+            .await
+            .unwrap();
+
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            request.push(stream.read_u8().await.unwrap());
+        }
+        assert!(request.starts_with(b"GET /path HTTP/1.1\r\n"));
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+            .await
+            .unwrap();
+    });
+
+    let response = Client::builder()
+        .no_proxy()
+        .proxy(proxy)
+        .build()
+        .unwrap()
+        .get("http://origin.invalid/path")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    peer.await.unwrap();
 }

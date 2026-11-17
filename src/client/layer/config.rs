@@ -11,7 +11,11 @@ use netty::http2::Http2Options;
 use tower::{Layer, Service};
 
 use crate::{
-    Error, config::RequestConfig, conn::net::SocketBindOptions, ext::UriExt, group::Group,
+    Error,
+    config::RequestConfig,
+    conn::net::SocketBindOptions,
+    ext::UriExt,
+    group::Group,
     header::{OrderedHeaders, OrigHeaderMap},
     proxy::Matcher,
     tls::TlsOptions,
@@ -135,10 +139,10 @@ where
         // store the original headers or the wire-order header list in request extensions
         if let Some(orig_headers) = self.config.orig_headers.take(req.extensions_mut()) {
             netty::ext::on_preserve_header(&mut req, orig_headers);
-        } else if let Some(ordered) = req.extensions_mut().remove::<OrderedHeaders>() {
-            if !ordered.is_empty() {
-                netty::ext::on_preserve_header(&mut req, ordered);
-            }
+        } else if let Some(ordered) = req.extensions_mut().remove::<OrderedHeaders>()
+            && !ordered.is_empty()
+        {
+            netty::ext::on_preserve_header(&mut req, ordered);
         }
 
         Either::Left(self.inner.call(req))

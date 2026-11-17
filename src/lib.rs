@@ -315,9 +315,9 @@ mod rt;
 mod sync;
 mod util;
 
+pub mod conn;
 #[cfg(feature = "cookies")]
 pub mod cookie;
-pub mod conn;
 pub mod dns;
 pub mod header;
 pub mod redirect;
