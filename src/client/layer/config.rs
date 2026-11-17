@@ -11,7 +11,11 @@ use netty::http2::Http2Options;
 use tower::{Layer, Service};
 
 use crate::{
-    Error, config::RequestConfig, conn::net::SocketBindOptions, ext::UriExt, group::Group,
+    Error,
+    config::RequestConfig,
+    conn::net::SocketBindOptions,
+    ext::UriExt,
+    group::Group,
     header::{OrderedHeaders, OrigHeaderMap},
     proxy::Matcher,
     tls::TlsOptions,
