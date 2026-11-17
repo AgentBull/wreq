@@ -404,34 +404,25 @@ async fn tunnel_includes_user_agent() {
 #[tokio::test]
 async fn proxy_tunnel_connect_error() {
     let client = Client::builder()
-        .tls_cert_verification(false)
+        .resolve_to_addrs("proxy.invalid", [])
+        .resolve_to_addrs("origin.invalid", [])
         .no_proxy()
         .build()
         .unwrap();
 
-    let invalid_proxies = vec![
-        "http://invalid.proxy:8080",
-        "https://invalid.proxy:8080",
-        "socks4://invalid.proxy:8080",
-        "socks4a://invalid.proxy:8080",
-        "socks5://invalid.proxy:8080",
-        "socks5h://invalid.proxy:8080",
-    ];
-
-    let target_urls = ["https://example.com", "http://example.com"];
-
-    for proxy in invalid_proxies {
-        for url in target_urls {
+    for scheme in ["http", "https", "socks4", "socks4a", "socks5", "socks5h"] {
+        let proxy = wreq::Proxy::all(format!("{scheme}://proxy.invalid:8080")).unwrap();
+        for url in ["https://origin.invalid/", "http://origin.invalid/"] {
             let err = client
                 .get(url)
-                .proxy(wreq::Proxy::all(proxy).unwrap())
+                .proxy(proxy.clone())
                 .send()
                 .await
                 .unwrap_err();
 
             assert!(
                 err.is_proxy_connect(),
-                "proxy connect error expected, got: {err:?}"
+                "{scheme} proxy connect error for {url} expected, got: {err:?}"
             );
         }
     }
